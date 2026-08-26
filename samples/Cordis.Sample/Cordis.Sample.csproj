@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Cordis.Sample</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Cordis\Cordis.csproj" />
+    <ProjectReference Include="..\..\src\Cordis.Timer\Cordis.Timer.csproj" />
+    <ProjectReference Include="..\..\src\Cordis.Loader\Cordis.Loader.csproj" />
+  </ItemGroup>
+
+</Project>

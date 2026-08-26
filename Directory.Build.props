@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup>
+    <!-- Ships as net10.0. Build with -p:CordisTfm=net8.0 to compile on an older SDK. -->
+    <TargetFramework Condition="'$(CordisTfm)' != ''">$(CordisTfm)</TargetFramework>
+    <TargetFramework Condition="'$(CordisTfm)' == ''">net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+</Project>
