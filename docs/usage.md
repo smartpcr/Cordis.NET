@@ -152,7 +152,9 @@ ctx.Set("clock", new FakeClock());         // swap the value; dependents reload
 ```
 
 `[ServiceName]` on the type is what `ctx.Get<T>()` and `[Inject(typeof(T))]` look up; without it
-the full type name is used. `Service<TSelf>` derives the name from the type for you.
+the full type name is used. The base constructor comes in three forms that agree with that lookup:
+`Service(ctx)` takes the name from the type, `Service<TSelf>(ctx)` does the same through the type
+parameter, and `Service(ctx, "name")` sets it explicitly.
 
 **Consuming.** Declare, then get:
 
@@ -468,8 +470,6 @@ Persist config in a `JsonConfigFile`, and let plugins that can adopt changes che
 
 ## Pitfalls
 
-- **`Service(Context ctx)` without a name** registers the service as `"Cordis.Context"`. Use
-  `Service(ctx, "name")` or `Service<TSelf>`.
 - **Undeclared access throws.** Declare every service a plugin reads, including in child plugins.
 - **`await fiber` on a plugin waiting for dependencies returns `Pending`,** it does not wait for
   the dependencies. Await the provider, or poll `State` in tests.

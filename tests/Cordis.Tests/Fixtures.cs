@@ -59,3 +59,18 @@ public static class TestEvents
     public static readonly BailKey<string, string> Resolve = new("resolve");
     public static readonly WaterfallKey<string> Transform = new("transform");
 }
+
+/// <summary>Uses the constructor without a name; registers under its <c>[ServiceName]</c>.</summary>
+[ServiceName("attribute-named")]
+public sealed class AttributeNamedService(Context ctx) : Service(ctx);
+
+/// <summary>Uses the constructor without a name and has no attribute; registers under its full type name.</summary>
+public sealed class TypeNamedService(Context ctx) : Service(ctx);
+
+[Inject(typeof(AttributeNamedService))]
+[Inject(typeof(TypeNamedService))]
+public sealed class NeedsUnnamedServices(Context ctx)
+{
+    public AttributeNamedService First { get; } = ctx.Get<AttributeNamedService>();
+    public TypeNamedService Second { get; } = ctx.Get<TypeNamedService>();
+}

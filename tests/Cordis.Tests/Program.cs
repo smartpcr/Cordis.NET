@@ -327,6 +327,21 @@ Harness.Case("loader reads and rewrites a json file", async () =>
     directory.Delete(recursive: true);
 });
 
+Harness.Case("a service constructed without a name registers under its own type's name", async () =>
+{
+    var root = new Context();
+    await root.Plugin<AttributeNamedService>();
+    await root.Plugin<TypeNamedService>();
+
+    Assert.Equal("attribute-named", root.Get<AttributeNamedService>().Name);
+    Assert.Equal(typeof(TypeNamedService).FullName, root.Get<TypeNamedService>().Name);
+    Assert.True(!root.Has("Cordis.Context"), "a service was registered under the context's type name");
+
+    var consumer = await root.Plugin<NeedsUnnamedServices>();
+    Assert.Equal(FiberState.Active, consumer.State);
+    Assert.True(consumer.Instance is NeedsUnnamedServices { First: not null, Second: not null }, "dependencies did not resolve");
+});
+
 UpstreamSyncTests.Register();
 
 return await Harness.RunAsync();

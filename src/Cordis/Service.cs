@@ -8,13 +8,25 @@ public abstract class Service : IContextScoped
 {
     protected Service(Context ctx, string name)
     {
+        ArgumentNullException.ThrowIfNull(ctx);
+        ArgumentException.ThrowIfNullOrEmpty(name);
         Ctx = ctx;
         Name = name;
         Ctx.Provide(name, this, CheckAvailable);
     }
 
-    protected Service(Context ctx) : this(ctx, ServiceNames.For(ctx is null ? typeof(object) : ctx.GetType()))
+    /// <summary>
+    /// Registers under the name of the concrete service type: its <see cref="ServiceNameAttribute"/>,
+    /// or its full type name. This is the name <c>ctx.Get&lt;T&gt;()</c> and <c>[Inject(typeof(T))]</c>
+    /// look up.
+    /// </summary>
+    protected Service(Context ctx)
     {
+        // A constructor initializer cannot see `this`, so the runtime type is read here instead.
+        ArgumentNullException.ThrowIfNull(ctx);
+        Ctx = ctx;
+        Name = ServiceNames.For(GetType());
+        Ctx.Provide(Name, this, CheckAvailable);
     }
 
     /// <summary>The context this instance is bound to. Rebound per caller by <see cref="ForContext"/>.</summary>

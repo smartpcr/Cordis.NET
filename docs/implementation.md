@@ -124,6 +124,10 @@ the core needs runtime code generation.
 
 ## Services and the store
 
+- `Service(ctx)` names the service after the concrete type (`ServiceNames.For(GetType())`), read in
+  the constructor body because a constructor initializer cannot see `this`. `Service(ctx, name)`
+  and `Service<TSelf>` name it explicitly.
+
 - `ServiceStore._store` maps an `IsolateKey` to the one live binding in that realm. Providing into a
   realm that already has a binding throws.
 - `Context.KeyFor(name)` walks the context's isolate `ChainMap`; a name never isolated resolves to a
@@ -176,8 +180,6 @@ exporter that throws is ignored.
 
 ## Known limitations
 
-- `Service(Context ctx)` (the constructor without a name) derives the name from `ctx.GetType()`,
-  which registers the service as `"Cordis.Context"`. Use `Service(ctx, "name")` or `Service<TSelf>`.
 - A fiber's effects are disposed sequentially, so one slow async cleanup delays the cleanups
   registered before it.
 - `Notify` is linear in the number of fibers.
