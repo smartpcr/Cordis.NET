@@ -59,6 +59,7 @@ public sealed class PluginRuntime(
 public sealed class RegistryService(Context root)
 {
     private readonly Dictionary<object, PluginRuntime> _runtimes = new(ReferenceEqualityComparer.Instance);
+    private readonly Dictionary<object, object> _aliases = new(ReferenceEqualityComparer.Instance);
     private int _counter;
 
     internal int NextUid() => Interlocked.Increment(ref _counter);
@@ -75,12 +76,22 @@ public sealed class RegistryService(Context root)
 
     public bool Has(object key)
     {
-        lock (root.SyncRoot) return _runtimes.ContainsKey(key);
+        lock (root.SyncRoot) return _runtimes.ContainsKey(Forward(key));
     }
 
     public PluginRuntime? Get(object key)
     {
-        lock (root.SyncRoot) return _runtimes.GetValueOrDefault(key);
+        lock (root.SyncRoot) return _runtimes.GetValueOrDefault(Forward(key));
+    }
+
+    /// <summary>Follow the replacements recorded by <see cref="Replace"/> to the current plugin.</summary>
+    public object Forward(object plugin)
+    {
+        lock (root.SyncRoot)
+        {
+            while (_aliases.TryGetValue(plugin, out var next)) plugin = next;
+            return plugin;
+        }
     }
 
     internal PluginRuntime GetOrAdd(object key, Func<PluginRuntime> factory)
@@ -94,9 +105,16 @@ public sealed class RegistryService(Context root)
         }
     }
 
-    internal void Remove(object key)
+    /// <summary>Drop a runtime whose last fiber is gone, unless its key has been taken over since.</summary>
+    internal void Unregister(PluginRuntime runtime)
     {
-        lock (root.SyncRoot) _runtimes.Remove(key);
+        lock (root.SyncRoot)
+        {
+            if (_runtimes.TryGetValue(runtime.Key, out var current) && ReferenceEquals(current, runtime))
+            {
+                _runtimes.Remove(runtime.Key);
+            }
+        }
     }
 
     /// <summary>Unload every fiber of a plugin. Analogue of <c>registry.delete()</c>.</summary>
@@ -105,15 +123,88 @@ public sealed class RegistryService(Context root)
         PluginRuntime? runtime;
         lock (root.SyncRoot)
         {
-            if (!_runtimes.TryGetValue(key, out runtime)) return;
-            _runtimes.Remove(key);
+            if (!_runtimes.Remove(Forward(key), out runtime)) return;
         }
         foreach (var fiber in runtime.Fibers) await fiber.DisposeAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Swap the implementation behind every fiber of <paramref name="oldPlugin"/> in place: each
+    /// fiber keeps its parent, its config and its identity, takes the dependencies of
+    /// <paramref name="newPlugin"/>, and reloads (validating its config with the new schema).
+    /// <paramref name="oldPlugin"/> is forwarded to <paramref name="newPlugin"/> from now on, so a
+    /// later <c>ctx.Plugin(oldPlugin)</c> creates a fiber of the new one. Plugins are a
+    /// <see cref="Type"/> or an <see cref="IPlugin"/> instance. Analogue of <c>registry.replace()</c>.
+    /// </summary>
+    /// <returns>The fibers that were moved.</returns>
+    public IReadOnlyList<Fiber> Replace(object oldPlugin, object newPlugin)
+    {
+        PluginFactory.EnsurePlugin(oldPlugin);
+        PluginFactory.EnsurePlugin(newPlugin);
+
+        lock (root.SyncRoot)
+        {
+            var oldKey = Forward(oldPlugin);
+
+            // the new plugin is an implementation of its own again
+            _aliases.Remove(newPlugin);
+            _runtimes.TryGetValue(oldKey, out var runtime);
+            _runtimes.TryGetValue(newPlugin, out var target);
+            if (!ReferenceEquals(oldKey, newPlugin))
+            {
+                _runtimes.Remove(oldKey);
+                _aliases[oldKey] = newPlugin;
+            }
+
+            IReadOnlyList<Fiber> fibers = runtime?.Fibers ?? [];
+            if (fibers.Count == 0) return fibers;
+
+            if (target is null)
+            {
+                target = PluginFactory.ForKey(newPlugin);
+                _runtimes[newPlugin] = target;
+            }
+
+            foreach (var fiber in fibers) fiber.Replace(target, PluginFactory.InjectFor(newPlugin));
+            return fibers;
+        }
     }
 }
 
 internal static class PluginFactory
 {
+    /// <summary>Runtime for a <see cref="Type"/> or <see cref="IPlugin"/> key.</summary>
+    public static PluginRuntime ForKey(object key) => key switch
+    {
+        Type type => ForType(type),
+        IPlugin plugin => ForInstance(plugin),
+        _ => throw InvalidPlugin(key),
+    };
+
+    /// <summary>Dependencies of a <see cref="Type"/> or <see cref="IPlugin"/> key.</summary>
+    public static Dictionary<string, object?> InjectFor(object key)
+    {
+        switch (key)
+        {
+            case Type type:
+                return InjectOf(type);
+            case IPlugin plugin:
+                var inject = InjectOf(plugin.Inject);
+                foreach (var (name, value) in InjectOf(plugin.GetType())) inject[name] = value;
+                return inject;
+            default:
+                throw InvalidPlugin(key);
+        }
+    }
+
+    public static void EnsurePlugin(object key)
+    {
+        if (key is not (Type or IPlugin)) throw InvalidPlugin(key);
+    }
+
+    private static CordisException InvalidPlugin(object? key)
+        => new($"invalid plugin, expect a Type or an IPlugin, received {key?.GetType().Name ?? "null"}");
+
     public static PluginRuntime ForType(Type type)
     {
         var schema = FindSchema(type);

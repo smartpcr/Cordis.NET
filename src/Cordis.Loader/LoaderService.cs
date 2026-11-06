@@ -21,8 +21,16 @@ public sealed class EntryOptions
 
     public string[]? Inject { get; set; }
 
-    /// <summary>Service name to realm label. A fresh label creates a private realm.</summary>
+    /// <summary>
+    /// Service name to realm label. Entries with the same label share a realm; <c>true</c> (or the
+    /// string <c>"true"</c>) gives the entry a realm of its own. Any string, including the empty
+    /// string, is a label.
+    /// </summary>
+    [JsonConverter(typeof(IsolateMapConverter))]
     public Dictionary<string, string>? Isolate { get; set; }
+
+    /// <summary>Separator of nested entry ids; an id must not contain it.</summary>
+    public const char Separator = ':';
 
     public List<EntryOptions>? Children { get; set; }
 
@@ -120,14 +128,14 @@ public sealed class LoaderService : Service
 
     private readonly Dictionary<string, Entry> _entries = new(StringComparer.Ordinal);
     private readonly Dictionary<Fiber, Entry> _byFiber = [];
-    private readonly Dictionary<string, IsolateKey> _realms = new(StringComparer.Ordinal);
+    private readonly Dictionary<(bool Private, string Label), IsolateKey> _realms = [];
     private List<EntryOptions> _current = [];
 
     public LoaderService(Context ctx) : base(ctx, "loader")
     {
         Resolver = new TypePluginResolver();
-        ctx.Internal.Updating += OnUpdating;
-        ctx.Effect(() => () => ctx.Internal.Updating -= OnUpdating, "loader/updating");
+        ctx.Internal.Committed += OnCommitted;
+        ctx.Effect(() => () => ctx.Internal.Committed -= OnCommitted, "loader/committed");
     }
 
     public IPluginResolver Resolver { get; set; }
@@ -214,8 +222,16 @@ public sealed class LoaderService : Service
     {
         foreach (var options in entries)
         {
-            if (string.IsNullOrEmpty(options.Id)) options.Id = Guid.NewGuid().ToString("n")[..8];
-            var id = parentId is null ? options.Id : $"{parentId}:{options.Id}";
+            if (string.IsNullOrEmpty(options.Id))
+            {
+                options.Id = Guid.NewGuid().ToString("n")[..8];
+            }
+            else if (options.Id.Contains(EntryOptions.Separator))
+            {
+                // such an id could never be found again by its path
+                throw new CordisException($"entry id must not contain \"{EntryOptions.Separator}\": {options.Id}");
+            }
+            var id = parentId is null ? options.Id : $"{parentId}{EntryOptions.Separator}{options.Id}";
             sink[id] = (options, parentId);
             if (options.Children is { Count: > 0 }) Flatten(options.Children, id, sink);
         }
@@ -223,7 +239,7 @@ public sealed class LoaderService : Service
 
     private static bool Patch(List<EntryOptions> entries, string id, EntryOptions replacement)
     {
-        var segments = id.Split(':');
+        var segments = id.Split(EntryOptions.Separator);
         var cursor = entries;
         for (var i = 0; i < segments.Length; i++)
         {
@@ -304,11 +320,15 @@ public sealed class LoaderService : Service
 
     private IsolateKey RealmKey(string realm, string entryId)
     {
-        // "true" (or an empty label) means a realm private to this entry.
-        var label = realm is "true" or "" ? $"{entryId}#private" : realm;
+        // "true" means a realm private to this entry; every other string, "" included, is a shared
+        // label. The two live in separate key spaces, so no label can collide with a private realm.
+        var slot = realm == IsolateMapConverter.Private ? (true, entryId) : (false, realm);
         lock (_realms)
         {
-            if (!_realms.TryGetValue(label, out var key)) _realms[label] = key = new IsolateKey(label);
+            if (!_realms.TryGetValue(slot, out var key))
+            {
+                _realms[slot] = key = new IsolateKey(slot.Item1 ? $"{entryId}#private" : realm);
+            }
             return key;
         }
     }
@@ -316,22 +336,22 @@ public sealed class LoaderService : Service
     private Type Resolve(string name)
         => Resolver.Resolve(name) ?? throw new CordisException($"cannot resolve plugin \"{name}\"");
 
-    private void OnUpdating(FiberUpdate update)
+    /// <summary>Persist a config committed through <see cref="Fiber.UpdateAsync"/>, as the caller gave it.</summary>
+    private void OnCommitted(Fiber fiber, object? config)
     {
-        if (update.NoSave) return;
         Entry? entry;
         lock (_entries)
         {
-            if (!_byFiber.TryGetValue(update.Fiber, out entry)) return;
+            if (!_byFiber.TryGetValue(fiber, out entry)) return;
         }
-        var schema = update.Fiber.Runtime?.Schema;
-        var simplified = schema is null ? update.Config : schema.Simplify(update.Config);
+        var schema = fiber.Runtime?.Schema;
+        var simplified = schema is null ? config : schema.Simplify(config);
         var options = entry.Options.Clone();
         options.Config = simplified is null
             ? null
             : JsonSerializer.SerializeToElement(simplified, simplified.GetType(), JsonOptions);
         entry.Options = options;
-        Patch(_current, entry.Id, options.Clone());
+        lock (_entries) Patch(_current, entry.Id, options.Clone());
         ConfigChanged?.Invoke();
     }
 
@@ -364,5 +384,43 @@ public sealed class LoaderService : Service
             .FirstOrDefault(candidate => candidate.GetParameters() is { Length: 2 } parameters
                 && parameters[0].ParameterType == typeof(Context));
         return ctor?.GetParameters()[1].ParameterType;
+    }
+}
+
+/// <summary>
+/// Reads an isolate map whose values are a realm label (any string) or <c>true</c> for a private
+/// realm, and writes <c>true</c> back for the latter.
+/// </summary>
+public sealed class IsolateMapConverter : JsonConverter<Dictionary<string, string>>
+{
+    public const string Private = "true";
+
+    public override Dictionary<string, string> Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType != JsonTokenType.StartObject) throw new JsonException("isolate must be an object");
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
+        {
+            var name = reader.GetString()!;
+            reader.Read();
+            result[name] = reader.TokenType switch
+            {
+                JsonTokenType.String => reader.GetString()!,
+                JsonTokenType.True => Private,
+                _ => throw new JsonException($"isolate.{name} must be a label or true"),
+            };
+        }
+        return result;
+    }
+
+    public override void Write(Utf8JsonWriter writer, Dictionary<string, string> value, JsonSerializerOptions options)
+    {
+        writer.WriteStartObject();
+        foreach (var (name, label) in value)
+        {
+            if (label == Private) writer.WriteBoolean(name, true);
+            else writer.WriteString(name, label);
+        }
+        writer.WriteEndObject();
     }
 }

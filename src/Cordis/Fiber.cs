@@ -14,13 +14,12 @@ public enum FiberState
     Unloading,
 }
 
-/// <summary>Mutable payload of an <see cref="InternalEvents.Updating"/> notification.</summary>
-public sealed class FiberUpdate(Fiber fiber, object? config, bool noSave)
-{
-    public Fiber Fiber { get; } = fiber;
-    public object? Config { get; set; } = config;
-    public bool NoSave { get; } = noSave;
-}
+/// <summary>
+/// Intercepts a <see cref="Fiber.UpdateAsync"/> of the fiber it was registered on. Receives the
+/// validated config and a <c>next</c> that restarts the fiber; a handler that applies the config
+/// in place returns without calling <c>next</c>. Analogue of a fiber-local <c>internal/update</c>.
+/// </summary>
+public delegate ValueTask ConfigUpdateHandler(object? resolvedConfig, Func<ValueTask> next);
 
 /// <summary>
 /// One live instantiation of a plugin. Owns the effects the plugin created, tracks the
@@ -31,15 +30,18 @@ public sealed class Fiber : IAsyncDisposable
 {
     internal const string InactiveEpoch = "\u0000inactive";
 
-    private readonly Dictionary<string, object?> _inject;
     private readonly Dictionary<string, ServiceImpl> _candidates = new(StringComparer.Ordinal);
     private readonly List<EffectHandle> _effects = [];
     private readonly List<Task> _loadTasks = [];
+    private readonly List<UpdateHook> _updateHooks = [];
     private readonly EffectHandle? _anchor;
+    private Dictionary<string, object?> _inject;
     private string _epoch = InactiveEpoch;
+    private int _revision;
     private Task? _inertia;
     private Exception? _error;
     private object? _instance;
+    private TaskCompletionSource? _releaseSignal;
 
     /// <summary>Root fiber: always active, owns nothing but the top-level effects.</summary>
     internal Fiber(Context root)
@@ -49,9 +51,9 @@ public sealed class Fiber : IAsyncDisposable
         Ctx = root;
         Uid = 0;
         _inject = new Dictionary<string, object?>(StringComparer.Ordinal);
-        _epoch = string.Empty;
+        _epoch = "0";
         State = FiberState.Active;
-        Store = new Dictionary<string, ServiceImpl>(StringComparer.Ordinal);
+        Committed = new Dictionary<string, ServiceImpl>(StringComparer.Ordinal);
     }
 
     internal Fiber(Context parent, PluginRuntime runtime, object? config, Dictionary<string, object?> inject)
@@ -59,9 +61,10 @@ public sealed class Fiber : IAsyncDisposable
         Gate = parent.SyncRoot;
         Parent = parent;
         Runtime = runtime;
+        Config = config;
         _inject = inject;
         Uid = parent.Registry.NextUid();
-        Ctx = parent.ExtendForFiber(this, inject);
+        Ctx = parent.ExtendForFiber(this);
 
         parent.Internal.RaisePluginChanged(this);
 
@@ -72,7 +75,6 @@ public sealed class Fiber : IAsyncDisposable
             runtime.Attach(this);
             try
             {
-                Config = runtime.Schema is not null ? runtime.Schema.Validate(config) : config;
                 Refresh();
             }
             catch (Exception error)
@@ -90,30 +92,34 @@ public sealed class Fiber : IAsyncDisposable
                 lock (Gate)
                 {
                     Uid = null;
-                    runtime.Detach(this);
-                    if (runtime.FiberCount == 0) parent.Registry.Remove(runtime.Key);
+                    // the fiber may have been moved to another runtime by Registry.Replace
+                    var current = Runtime!;
+                    current.Detach(this);
+                    if (current.FiberCount == 0) parent.Registry.Unregister(current);
                     SetEpoch(InactiveEpoch);
                 }
 
                 parent.Internal.RaisePluginChanged(this);
 
+                // the transitions never fault: reload and unload log their own errors
                 while (true)
                 {
                     Task? inertia;
                     lock (Gate) inertia = _inertia;
                     if (inertia is null) break;
-                    try { await inertia.ConfigureAwait(false); }
-                    catch { /* reported by the transition itself */ }
+                    await inertia.ConfigureAwait(false);
                 }
 
-                lock (Gate) State = FiberState.Disposed;
+                // SetEpoch above is a no-op for a fiber that never loaded or that failed, so the
+                // state is re-derived here; with Uid gone it settles to Disposed.
+                lock (Gate) UpdateState(static () => null);
             };
         }, "ctx.Plugin()");
     }
 
     internal object Gate { get; }
 
-    /// <summary>Incrementing identity; <c>null</c> once disposed. Part of the epoch key.</summary>
+    /// <summary>Incrementing identity; <c>null</c> once disposed.</summary>
     public int? Uid { get; private set; }
 
     /// <summary>The context this fiber was created from.</summary>
@@ -122,8 +128,14 @@ public sealed class Fiber : IAsyncDisposable
     /// <summary>The context handed to the plugin body.</summary>
     public Context Ctx { get; }
 
-    public PluginRuntime? Runtime { get; }
+    /// <summary>The implementation behind this fiber. Changes when <see cref="RegistryService.Replace"/> moves it.</summary>
+    public PluginRuntime? Runtime { get; private set; }
 
+    /// <summary>
+    /// The source config, as given to <c>ctx.Plugin()</c> or <see cref="UpdateAsync"/>. It is
+    /// validated against the plugin's schema on every load, so it is never stale against a
+    /// replaced schema.
+    /// </summary>
     public object? Config { get; private set; }
 
     public FiberState State { get; private set; } = FiberState.Pending;
@@ -132,8 +144,11 @@ public sealed class Fiber : IAsyncDisposable
 
     public IReadOnlyDictionary<string, object?> Inject => _inject;
 
-    /// <summary>Providers visible to the plugin body; <c>null</c> while unloaded.</summary>
-    internal Dictionary<string, ServiceImpl>? Store { get; private set; }
+    /// <summary>Injected providers committed by the current load; <c>null</c> while unloaded.</summary>
+    internal Dictionary<string, ServiceImpl>? Committed { get; private set; }
+
+    /// <summary>Services this fiber provides itself, including retired ones still draining. Guarded by <see cref="Gate"/>.</summary>
+    internal HashSet<ServiceImpl> Provisions { get; } = [];
 
     public object? Instance => _instance;
 
@@ -183,6 +198,11 @@ public sealed class Fiber : IAsyncDisposable
     /// <summary>
     /// Generator form: yield one disposer per acquired resource. The analogue of cordis'
     /// <c>function*</c> effects. Pass an iterator local function.
+    /// <para>
+    /// Once the effect is disposed or the fiber's epoch moves on (an update, a lost dependency),
+    /// the iterator is not advanced again: the disposer it yields last is still collected, and the
+    /// iterator is then closed, so its <c>finally</c> blocks run before the collected disposers.
+    /// </para>
     /// </summary>
     public EffectHandle EffectMany(Func<IAsyncEnumerable<Disposer>> execute, string label = "anonymous")
     {
@@ -190,7 +210,13 @@ public sealed class Fiber : IAsyncDisposable
 
         async Task Body(EffectHandle handle)
         {
-            await foreach (var disposer in execute().ConfigureAwait(false)) handle.Collect(disposer);
+            string epoch;
+            lock (Gate) epoch = _epoch;
+            await foreach (var disposer in execute().ConfigureAwait(false))
+            {
+                handle.Collect(disposer);
+                if (!handle.IsAlive || EpochChanged(epoch)) break;
+            }
         }
     }
 
@@ -203,10 +229,37 @@ public sealed class Fiber : IAsyncDisposable
     internal EffectHandle EffectSync(Func<Disposer?> execute, string label)
         => Run(label, handle => { handle.Collect(execute()); return null; });
 
+    /// <summary>
+    /// Register a <see cref="ConfigUpdateHandler"/> on this fiber. It is an effect: it goes away
+    /// when the fiber unloads, so a plugin that registers one on every load does not accumulate them.
+    /// </summary>
+    public EffectHandle OnConfigUpdate(ConfigUpdateHandler handler, bool prepend = false)
+    {
+        return EffectSync(() =>
+        {
+            var hook = new UpdateHook(handler);
+            lock (Gate)
+            {
+                if (prepend) _updateHooks.Insert(0, hook); else _updateHooks.Add(hook);
+            }
+            return () =>
+            {
+                hook.Removed = true;
+                lock (Gate) _updateHooks.Remove(hook);
+                return default;
+            };
+        }, "ctx.OnConfigUpdate()");
+    }
+
     /// <summary>Snapshot of the effects currently owned by this fiber.</summary>
     public IReadOnlyList<EffectHandle> Effects
     {
         get { lock (Gate) return [.. _effects]; }
+    }
+
+    private bool EpochChanged(string epoch)
+    {
+        lock (Gate) return _epoch != epoch;
     }
 
     private EffectHandle Run(string label, Func<EffectHandle, Task?> body)
@@ -274,20 +327,27 @@ public sealed class Fiber : IAsyncDisposable
     {
         lock (Gate)
         {
-            if (Store is not null && Store.TryGetValue(name, out impl!)) return true;
+            if (Committed is not null && Committed.TryGetValue(name, out impl!)) return true;
         }
         impl = default!;
         return false;
     }
 
-    internal void AddOwnService(string name, ServiceImpl impl)
+    /// <summary>A service this fiber provides itself in the realm <paramref name="key"/>; the live binding wins.</summary>
+    internal bool TryGetProvision(string name, IsolateKey key, out ServiceImpl impl)
     {
-        lock (Gate) (Store ??= new Dictionary<string, ServiceImpl>(StringComparer.Ordinal))[name] = impl;
-    }
-
-    internal void RemoveOwnService(string name)
-    {
-        lock (Gate) Store?.Remove(name);
+        lock (Gate)
+        {
+            ServiceImpl? found = null;
+            foreach (var provision in Provisions)
+            {
+                if (provision.Name != name || !ReferenceEquals(provision.Isolate, key)) continue;
+                found = provision;
+                if (Ctx.Reflect.IsCurrent(provision)) break;
+            }
+            impl = found!;
+            return found is not null;
+        }
     }
 
     /// <summary>Re-evaluate whether <paramref name="name"/> currently has a usable provider.</summary>
@@ -309,7 +369,7 @@ public sealed class Fiber : IAsyncDisposable
             }
             catch (Exception error)
             {
-                impl.Fiber.Ctx.Logger.Error(error);
+                impl.Ctx.Logger.Error(error);
                 ok = false;
             }
             if (!ok)
@@ -322,26 +382,27 @@ public sealed class Fiber : IAsyncDisposable
         lock (Gate) _candidates[name] = impl;
     }
 
-    /// <summary>Recompute the epoch from the identity of every injected provider.</summary>
+    /// <summary>
+    /// Recompute the epoch: the reload revision followed by the identity of every injected
+    /// binding. A new binding, a lost one, or a restart all change it.
+    /// </summary>
     internal void Refresh()
     {
-        string epoch;
         lock (Gate)
         {
-            var builder = new StringBuilder();
-            epoch = string.Empty;
+            if (Uid is null) return;
+            var builder = new StringBuilder().Append(_revision);
             foreach (var name in _inject.Keys)
             {
                 if (!_candidates.TryGetValue(name, out var impl))
                 {
-                    epoch = InactiveEpoch;
-                    break;
+                    SetEpoch(InactiveEpoch);
+                    return;
                 }
-                builder.Append(':').Append(impl.Fiber.Uid);
+                builder.Append(':').Append(impl.Uid);
             }
-            if (epoch != InactiveEpoch) epoch = builder.ToString();
+            SetEpoch(builder.ToString());
         }
-        SetEpoch(epoch);
     }
 
     private void SetEpoch(string epoch)
@@ -350,6 +411,8 @@ public sealed class Fiber : IAsyncDisposable
         {
             var old = _epoch;
             if (epoch == old) return;
+            // a failed fiber only recovers through UpdateAsync, which clears the error
+            if (_error is not null) return;
             _epoch = epoch;
             // inertia lock: a transition is already running; it reconciles on completion.
             if (_inertia is not null) return;
@@ -382,10 +445,11 @@ public sealed class Fiber : IAsyncDisposable
 
         Ctx.Internal.RaiseStatusChanged(this, old);
 
-        // only (de)activation is observable by dependents
+        // only (de)activation is observable by dependents, and only the bindings this fiber
+        // still holds in the store; each is notified in its own realm
         if (old != FiberState.Active && State != FiberState.Active) return;
-        var provided = Ctx.Reflect.NamesProvidedBy(this);
-        if (provided.Count > 0) Ctx.Reflect.Notify(Ctx, provided);
+        var provided = Provisions.Where(Ctx.Reflect.IsCurrent).ToArray();
+        if (provided.Length > 0) Ctx.Reflect.Notify(provided);
     }
 
     private async Task ReloadAsync()
@@ -395,21 +459,30 @@ public sealed class Fiber : IAsyncDisposable
         string epoch;
         lock (Gate)
         {
-            Store = new Dictionary<string, ServiceImpl>(_candidates, StringComparer.Ordinal);
+            Committed = new Dictionary<string, ServiceImpl>(_candidates, StringComparer.Ordinal);
+            foreach (var impl in Committed.Values)
+            {
+                if (!ReferenceEquals(impl.Fiber, this)) impl.Dependents.Add(this);
+            }
             epoch = _epoch;
         }
 
         try
         {
-            await ExecuteAsync().ConfigureAwait(false);
+            // an update that arrived while this load was queued supersedes it
+            if (!EpochChanged(epoch)) await ExecuteAsync().ConfigureAwait(false);
         }
         catch (Exception error)
         {
             Ctx.Logger.Error(error);
             lock (Gate)
             {
-                _error = error;
-                _epoch = InactiveEpoch;
+                // a superseded load still gets cleaned up, but cannot fail the newer target
+                if (_epoch == epoch)
+                {
+                    _error = error;
+                    _epoch = InactiveEpoch;
+                }
             }
         }
 
@@ -434,6 +507,24 @@ public sealed class Fiber : IAsyncDisposable
         // synchronous prefix ends there, so no await ever runs while the caller holds the lock.
         await Task.Yield();
 
+        // Dependents were notified when this fiber left ACTIVE, but may still use its services
+        // during their own teardown, so this fiber's effects wait until all of them have unloaded.
+        while (true)
+        {
+            Task wait;
+            lock (Gate)
+            {
+                if (!Provisions.Any(impl => impl.Dependents.Count > 0))
+                {
+                    _releaseSignal = null;
+                    break;
+                }
+                _releaseSignal ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                wait = _releaseSignal.Task;
+            }
+            await wait.ConfigureAwait(false);
+        }
+
         EffectHandle[] effects;
         lock (Gate)
         {
@@ -450,7 +541,15 @@ public sealed class Fiber : IAsyncDisposable
 
         lock (Gate)
         {
-            Store = null;
+            // release the providers waiting for this fiber to unload
+            foreach (var impl in Committed?.Values ?? Enumerable.Empty<ServiceImpl>())
+            {
+                if (!impl.Dependents.Remove(this) || impl.Dependents.Count > 0) continue;
+                impl.Release?.TrySetResult();
+                impl.Fiber.SignalRelease();
+            }
+
+            Committed = null;
             _instance = null;
             UpdateState(() =>
             {
@@ -465,9 +564,33 @@ public sealed class Fiber : IAsyncDisposable
         }
     }
 
+    /// <summary>Wake an unload waiting for dependents. Caller holds <see cref="Gate"/>.</summary>
+    private void SignalRelease()
+    {
+        var signal = _releaseSignal;
+        _releaseSignal = null;
+        signal?.TrySetResult();
+    }
+
+    private object? ResolveConfig(object? config)
+    {
+        var schema = Runtime?.Schema;
+        return schema is not null ? schema.Validate(config) : config;
+    }
+
     private async Task ExecuteAsync()
     {
-        var instance = await Runtime!.Apply(Ctx, Config).ConfigureAwait(false);
+        PluginRuntime runtime;
+        object? source;
+        lock (Gate)
+        {
+            runtime = Runtime!;
+            source = Config;
+        }
+
+        // resolved on every load, so a reload after Replace validates with the new schema
+        var resolved = ResolveConfig(source);
+        var instance = await runtime.Apply(Ctx, resolved).ConfigureAwait(false);
         lock (Gate) _instance = instance;
 
         switch (instance)
@@ -496,6 +619,29 @@ public sealed class Fiber : IAsyncDisposable
         }
     }
 
+    /// <summary>Move this fiber to <paramref name="runtime"/> in place. See <see cref="RegistryService.Replace"/>.</summary>
+    internal void Replace(PluginRuntime runtime, Dictionary<string, object?> inject)
+    {
+        lock (Gate)
+        {
+            if (Uid is null) return;
+            if (!ReferenceEquals(runtime, Runtime))
+            {
+                Runtime!.Detach(this);
+                runtime.Attach(this);
+                Runtime = runtime;
+            }
+            _inject = inject;
+            Ctx.Internal.RaiseReplaced(this);
+
+            _candidates.Clear();
+            foreach (var name in _inject.Keys) CheckImpl(name);
+            _error = null;
+            _revision++;
+            Refresh();
+        }
+    }
+
     // ------------------------------------------------------------- public API
 
     /// <summary>Wait until the fiber settles; rethrows the load error if it failed.</summary>
@@ -515,30 +661,65 @@ public sealed class Fiber : IAsyncDisposable
     /// <summary><c>await ctx.Plugin(...)</c> resolves once the fiber is active.</summary>
     public TaskAwaiter<Fiber> GetAwaiter() => WaitAsync().GetAwaiter();
 
+    /// <summary>
+    /// Reload with the same config. Bumps the revision rather than going through an inactive
+    /// epoch, so a restart issued during a transition is not lost. A failed fiber stays failed;
+    /// use <see cref="UpdateAsync"/> to recover it.
+    /// </summary>
     public async Task RestartAsync()
     {
         AssertActive();
         lock (Gate)
         {
-            SetEpoch(InactiveEpoch);
+            _revision++;
             Refresh();
         }
         await WaitAsync().ConfigureAwait(false);
     }
 
-    /// <summary>Replace the config and reload. <paramref name="noSave"/> suppresses loader write-back.</summary>
+    /// <summary>
+    /// Replace the config and reload.
+    /// <list type="bullet">
+    /// <item>While the fiber is loaded, the new config is validated first: an invalid one throws
+    /// and leaves the running plugin untouched. The handlers registered with
+    /// <see cref="OnConfigUpdate"/> then see the validated config and may apply it in place.</item>
+    /// <item>Unless <paramref name="noSave"/> is set, <see cref="InternalEvents.Committed"/> is raised
+    /// with the config as given, which is what the loader writes back.</item>
+    /// <item>A failed fiber is recovered: the error is cleared and the fiber loads again.</item>
+    /// </list>
+    /// </summary>
     public async Task UpdateAsync(object? config, bool noSave = false)
     {
         AssertActive();
-        var resolved = Runtime?.Schema is not null ? Runtime.Schema.Validate(config) : config;
-        var update = new FiberUpdate(this, resolved, noSave);
-        Ctx.Internal.RaiseUpdating(update);
+        bool loaded;
+        lock (Gate) loaded = _epoch != InactiveEpoch;
+        var resolved = loaded ? ResolveConfig(config) : null;
+
+        if (!noSave) Ctx.Internal.RaiseCommitted(this, config);
+
+        UpdateHook[] hooks;
         lock (Gate)
         {
-            Config = update.Config;
+            Config = config;
             _error = null;
+            hooks = loaded ? [.. _updateHooks] : [];
         }
-        await RestartAsync().ConfigureAwait(false);
+
+        var index = 0;
+        await Next().ConfigureAwait(false);
+
+        ValueTask Next()
+        {
+            while (index < hooks.Length && hooks[index].Removed) index++;
+            if (index >= hooks.Length) return new ValueTask(RestartAsync());
+            var hook = hooks[index++];
+            var called = 0;
+            return hook.Handler(resolved, () =>
+            {
+                if (Interlocked.Exchange(ref called, 1) == 1) throw new CordisException("next() called multiple times");
+                return Next();
+            });
+        }
     }
 
     public async ValueTask DisposeAsync()
@@ -560,6 +741,19 @@ public sealed class Fiber : IAsyncDisposable
         {
             try { await effects[i].DisposeAsync().ConfigureAwait(false); }
             catch (Exception error) { Ctx.Logger.Error(error); }
+        }
+    }
+
+    private sealed class UpdateHook(ConfigUpdateHandler handler)
+    {
+        private volatile bool _removed;
+
+        public ConfigUpdateHandler Handler { get; } = handler;
+
+        public bool Removed
+        {
+            get => _removed;
+            set => _removed = value;
         }
     }
 }

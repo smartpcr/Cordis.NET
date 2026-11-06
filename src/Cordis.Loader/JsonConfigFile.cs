@@ -57,9 +57,9 @@ public sealed class JsonConfigFile : IAsyncInit, IAsyncDisposable
         try
         {
             List<EntryOptions> entries;
-            if (File.Exists(FullPath))
+            var text = await ReadIfExistsAsync().ConfigureAwait(false);
+            if (text is not null)
             {
-                var text = await File.ReadAllTextAsync(FullPath).ConfigureAwait(false);
                 if (text == _lastWritten) return;
                 entries = JsonSerializer.Deserialize<List<EntryOptions>>(text, LoaderService.JsonOptions) ?? [];
             }
@@ -74,6 +74,22 @@ public sealed class JsonConfigFile : IAsyncInit, IAsyncDisposable
         finally
         {
             _mutex.Release();
+        }
+    }
+
+    /// <summary>
+    /// Only a file that does not exist counts as missing. Any other read failure (access denied,
+    /// a sharing violation) propagates, so the initial entries never overwrite a file that exists.
+    /// </summary>
+    private async Task<string?> ReadIfExistsAsync()
+    {
+        try
+        {
+            return await File.ReadAllTextAsync(FullPath).ConfigureAwait(false);
+        }
+        catch (Exception error) when (error is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return null;
         }
     }
 

@@ -13,6 +13,7 @@ public sealed class EffectHandle : IAsyncDisposable
     private readonly List<EffectHandle> _children = [];
     private Task? _pending;
     private bool _alive = true;
+    private bool _closed;
 
     internal EffectHandle(Fiber fiber, string label)
     {
@@ -34,7 +35,10 @@ public sealed class EffectHandle : IAsyncDisposable
         if (disposer is null) return;
         lock (Fiber.Gate)
         {
-            if (!_alive)
+            // A disposer collected while the handle drains (e.g. the final yield of a generator
+            // effect that is being closed) still joins the list; only after the drain has taken
+            // its snapshot is it run on the spot.
+            if (_closed)
             {
                 _ = disposer();
                 return;
@@ -76,6 +80,7 @@ public sealed class EffectHandle : IAsyncDisposable
         Disposer[] disposers;
         lock (Fiber.Gate)
         {
+            _closed = true;
             disposers = [.. _disposers];
             _disposers.Clear();
         }

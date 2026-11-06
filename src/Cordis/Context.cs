@@ -66,17 +66,7 @@ public sealed class Context : IAsyncDisposable
 
     // ------------------------------------------------------------- scoping
 
-    internal Context ExtendForFiber(Fiber fiber, IReadOnlyDictionary<string, object?> injectConfigs)
-    {
-        ChainMap<object>? intercept = null;
-        foreach (var (name, config) in injectConfigs)
-        {
-            if (config is null) continue;
-            intercept ??= InterceptMap.Extend();
-            intercept.Set(name, config);
-        }
-        return new Context(this, fiber, null, intercept);
-    }
+    internal Context ExtendForFiber(Fiber fiber) => new(this, fiber, null, null);
 
     /// <summary>A child context where <paramref name="name"/> resolves in a fresh realm.</summary>
     public Context Isolate(string name, IsolateKey? key = null)
@@ -98,12 +88,37 @@ public sealed class Context : IAsyncDisposable
 
     public Context Intercept<TService>(object config) => Intercept(ServiceNames.For<TService>(), config);
 
+    /// <summary>The nearest config bound to <paramref name="name"/>; see <see cref="InterceptChain{TConfig}"/>.</summary>
     public TConfig? GetInterceptConfig<TConfig>(string name) where TConfig : class
-        => InterceptMap.Chain(name).OfType<TConfig>().FirstOrDefault();
+        => InterceptChain<TConfig>(name).FirstOrDefault();
 
-    /// <summary>All intercept configs bound to <paramref name="name"/>, nearest first.</summary>
+    /// <summary>
+    /// All configs bound to <paramref name="name"/>, highest priority first: the context intercepts
+    /// from the innermost out, then the config the declaring fiber attached to its
+    /// <c>[Inject(name, Config = ...)]</c>, which sits under every context intercept.
+    /// </summary>
     public IEnumerable<TConfig> InterceptChain<TConfig>(string name)
-        => InterceptMap.Chain(name).OfType<TConfig>();
+    {
+        foreach (var config in InterceptMap.Chain(name).OfType<TConfig>()) yield return config;
+        if (InjectedConfig(name) is TConfig injected) yield return injected;
+    }
+
+    /// <summary>
+    /// The per-dependency config declared by the nearest fiber that injects <paramref name="name"/>.
+    /// The walk stops at a fiber that provides the service itself (own provisions take no injected
+    /// config) and at an isolation boundary for <paramref name="name"/>.
+    /// </summary>
+    internal object? InjectedConfig(string name)
+    {
+        var key = KeyFor(name);
+        for (var fiber = Fiber; ; fiber = fiber.Parent.Fiber)
+        {
+            if (fiber.TryGetProvision(name, key, out _)) return null;
+            if (!ReferenceEquals(fiber.Ctx.KeyFor(name), key)) return null;
+            if (fiber.Inject.TryGetValue(name, out var config)) return config;
+            if (fiber.Runtime is null) return null;
+        }
+    }
 
     internal IsolateKey KeyFor(string name)
     {
@@ -145,24 +160,27 @@ public sealed class Context : IAsyncDisposable
     // ------------------------------------------------------------- plugins
 
     public Fiber Plugin(Type type, object? config = null, IEnumerable<string>? inject = null)
+        => PluginCore(type, config, inject);
+
+    public Fiber Plugin<TPlugin>(object? config = null) => Plugin(typeof(TPlugin), config);
+
+    public Fiber Plugin(IPlugin plugin, object? config = null) => PluginCore(plugin, config, null);
+
+    /// <summary>
+    /// Shared by the type and instance forms. A plugin that <see cref="RegistryService.Replace"/>
+    /// moved away is forwarded to its replacement, whose dependencies are the ones that count.
+    /// </summary>
+    private Fiber PluginCore(object plugin, object? config, IEnumerable<string>? inject)
     {
-        var runtime = Registry.GetOrAdd(type, () => PluginFactory.ForType(type));
-        var dependencies = PluginFactory.InjectOf(type);
+        Fiber.AssertActive();
+        var target = Registry.Forward(plugin);
+        var runtime = Registry.GetOrAdd(target, () => PluginFactory.ForKey(target));
+        var dependencies = PluginFactory.InjectFor(target);
         if (inject is not null)
         {
             foreach (var name in inject) dependencies.TryAdd(name, null);
         }
         return CreateFiber(runtime, config, dependencies);
-    }
-
-    public Fiber Plugin<TPlugin>(object? config = null) => Plugin(typeof(TPlugin), config);
-
-    public Fiber Plugin(IPlugin plugin, object? config = null)
-    {
-        var runtime = Registry.GetOrAdd(plugin, () => PluginFactory.ForInstance(plugin));
-        var inject = PluginFactory.InjectOf(plugin.Inject);
-        foreach (var (name, value) in PluginFactory.InjectOf(plugin.GetType())) inject[name] = value;
-        return CreateFiber(runtime, config, inject);
     }
 
     /// <summary>Register an inline plugin body.</summary>
@@ -201,6 +219,10 @@ public sealed class Context : IAsyncDisposable
     public EffectHandle Use(IDisposable resource, string? label = null) => Fiber.Use(resource, label);
 
     public EffectHandle UseAsync(IAsyncDisposable resource, string? label = null) => Fiber.UseAsync(resource, label);
+
+    /// <summary>Intercept config updates of this context's fiber. See <see cref="Cordis.Fiber.OnConfigUpdate"/>.</summary>
+    public EffectHandle OnConfigUpdate(ConfigUpdateHandler handler, bool prepend = false)
+        => Fiber.OnConfigUpdate(handler, prepend);
 
     // --------------------------------------------------------------- events
 

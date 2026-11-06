@@ -327,4 +327,6 @@ Harness.Case("loader reads and rewrites a json file", async () =>
     directory.Delete(recursive: true);
 });
 
+UpstreamSyncTests.Register();
+
 return await Harness.RunAsync();
