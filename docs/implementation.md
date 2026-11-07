@@ -42,10 +42,13 @@ heavy, interface only, and hostile to trimming and AOT.
 
 ## The fiber state machine
 
-State lives in a handful of fields on `Fiber`, all guarded by `Gate` (the tree lock):
+State lives in a handful of fields on `Fiber`, all written under `Gate` (the tree lock). The ones
+other threads read without the lock (`State`, `Error`, `Config`, `Instance`) are `volatile`, so a
+reader sees the latest write; `Uid` is read under the lock.
 
 | Field | Meaning |
 | --- | --- |
+| `_uid` | the fiber's identity; `null` once disposed, after which no effect can be added |
 | `_epoch` | the target: `"<revision>:<uid>:<uid>..."` or `InactiveEpoch` |
 | `_candidates` | the binding currently seen for each injected name |
 | `Committed` | the bindings the running load was started with; `null` while unloaded |
@@ -71,11 +74,15 @@ JavaScript is single threaded; .NET is not. The rules:
    fiber, store, registry and event service of that tree. It is a plain `Monitor`, so it is
    reentrant: a notification that triggers a refresh that triggers a state change all run under
    one acquisition.
-2. **Never await while holding it.** A transition is started inside `lock (Gate)` and its first
-   statement is `await Task.Yield()`. The synchronous part of the async method ends at that yield,
-   while the caller still holds the lock; everything after it runs on the thread pool, outside.
-   Starting a transition without the yield runs plugin code under the lock, which deadlocks as
-   soon as that code awaits something that needs the lock.
+2. **Never await while holding it.** A transition is started inside `lock (Gate)` and yields
+   (`await Task.Yield()`) before it runs plugin code. The synchronous part of the async method ends
+   at that yield, while the caller still holds the lock; everything after it runs on the thread
+   pool, outside. Starting a transition without the yield runs plugin code under the lock, which
+   deadlocks as soon as that code awaits something that needs the lock.
+   `ReloadAsync` commits its bindings and captures the target epoch **before** the yield. Read
+   after it, another thread could have changed the target in between (a provider withdrawn, the
+   fiber disposed); the load would then run the plugin for a target that is already gone and
+   settle without unloading it, leaking its effects.
 3. **Events raised under the lock are synchronous.** `StatusChanged`, `ServiceChanged`,
    `Committed` and `Replaced` are raised inside the lock. Handlers must be quick and must not block
    on other fibers.
@@ -83,6 +90,17 @@ JavaScript is single threaded; .NET is not. The rules:
    for its dependents awaits a TCS that the last dependent completes; running continuations
    asynchronously keeps the completing thread (which holds the lock) from executing the
    provider's teardown inline.
+5. **Effect registration is check-and-add.** `Run` and `AttachDisposer` test `_uid` and add the
+   handle in one `lock (Gate)` block. Disposal clears `_uid` under the same lock and then drains,
+   so a racing `ctx.Effect(...)` is either refused with `InactiveFiberException` or seen by the
+   drain. (`AttachDisposer` runs the disposer at once instead of throwing.)
+6. **Disposal drains twice.** The unload drains the effects of the load. A disposed fiber then
+   drains again after its last transition, for effects created after that snapshot by callbacks
+   that outlived the load (a timer, a socket handler) or while the fiber sat in `Pending`. With
+   `_uid` cleared this second drain is final.
+7. **A disposed root is inert.** Root `DisposeAsync` clears its `_uid` before tearing the tree
+   down, so `root.Effect(...)`, `root.Plugin(...)` and friends throw afterwards instead of
+   creating resources nobody will release.
 
 ## Effects
 
@@ -95,6 +113,8 @@ JavaScript is single threaded; .NET is not. The rules:
 - `EffectMany` checks after every yield whether the handle is still alive and the epoch unchanged.
   If not, it stops: the disposer just yielded is still collected, the enumerator is disposed (its
   `finally` blocks run), and the collected disposers run afterwards, newest first.
+- `_alive` is `volatile`, and the pending task is set under the lock, because disposal can run on
+  another thread than the body that started the effect.
 - Disposal sets `_alive = false`, awaits the pending task, then takes a snapshot of the disposers
   and runs them in reverse. A disposer collected while the drain waits joins the snapshot; one
   collected after it runs immediately.
@@ -175,6 +195,13 @@ exporter that throws is ignored.
 - Entry ids are paths joined with `:`; an id containing `:` is rejected.
 - Realm labels map to `IsolateKey`s held by the loader. Private realms and shared labels use separate
   key spaces.
+- `ApplyAsync` and `SetDisabledAsync` take `_edits` (a `SemaphoreSlim(1, 1)`) for the
+  reconciliation and release it before waiting for the entries to settle. A reconciliation reads
+  the entry table, awaits disposals and updates, and writes the table back; two interleaved ones
+  lost entries ("unknown entry") or threw "Collection was modified". `OnCommitted` updates an
+  entry's options and the live table in one `lock (_entries)` block. Because the edit in progress
+  waits for loads, a plugin managed by the loader must not call `ApplyAsync` or
+  `SetDisabledAsync` from its own load path; start the edit from outside, or after the load.
 - `JsonConfigFile` debounces `FileSystemWatcher` events, ignores a reread of the text it wrote last,
   and treats only `FileNotFoundException` / `DirectoryNotFoundException` as "missing".
 
@@ -193,3 +220,10 @@ exporter that throws is ignored.
   Prefer `Assert.Eventually` to fixed sleeps.
 - For a behaviour change ported from upstream, add a case that fails on the old code, and record the
   commit in [upstream-sync.md](upstream-sync.md).
+- [`StressTests.cs`](../tests/Cordis.Tests/StressTests.cs) hammers the shared paths from 8 threads:
+  effects created during disposal, effects created while a fiber is pending, a disposed root,
+  provide and withdraw churn, listener churn during dispatch, and concurrent loader edits. Each
+  case counts acquisitions and releases and asserts they balance. Before the concurrency fixes 5
+  of the 6 cases failed (hundreds of leaked effects per run, loads exceeding unloads, loader
+  "unknown entry"). Run the suite several times after touching locking: a race shows up as an
+  occasional failure, not a constant one.

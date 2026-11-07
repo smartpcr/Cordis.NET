@@ -21,7 +21,7 @@ docs/                design, architecture, implementation notes, usage guide
 ```
 
 ```bash
-dotnet run --project tests/Cordis.Tests    # 39 tests, custom runner
+dotnet run --project tests/Cordis.Tests    # 46 tests (incl. stress), custom runner
 dotnet run --project samples/Cordis.Sample
 dotnet run --project samples/Cordis.Examples -- events   # or effects, services, isolate, gate, config, replace, loader
 ```

@@ -12,7 +12,7 @@ public sealed class EffectHandle : IAsyncDisposable
     private readonly List<Disposer> _disposers = [];
     private readonly List<EffectHandle> _children = [];
     private Task? _pending;
-    private bool _alive = true;
+    private volatile bool _alive = true;
     private bool _closed;
 
     internal EffectHandle(Fiber fiber, string label)
@@ -54,7 +54,10 @@ public sealed class EffectHandle : IAsyncDisposable
         }
     }
 
-    internal void SetPending(Task task) => _pending = task;
+    internal void SetPending(Task task)
+    {
+        lock (Fiber.Gate) _pending = task;
+    }
 
     /// <summary>Hands ownership of this effect to an enclosing effect.</summary>
     public Disposer ToDisposer() => DisposeAsync;

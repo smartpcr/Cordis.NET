@@ -343,5 +343,6 @@ Harness.Case("a service constructed without a name registers under its own type'
 });
 
 UpstreamSyncTests.Register();
+StressTests.Register();
 
 return await Harness.RunAsync();

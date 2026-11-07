@@ -387,7 +387,9 @@ await root.Plugin<JsonConfigFile>(new JsonConfigFile.Options { Path = "cordis.js
 Reconciliation per entry: new entries are created, removed ones disposed (children first), a
 config-only change becomes `UpdateAsync(config, noSave: true)`, and any other change recreates the
 entry. At runtime, `loader.ApplyAsync(entries)`, `loader.SetDisabledAsync(id, bool)`,
-`loader.Find(id)` and `loader.Snapshot()` work without a file. `JsonConfigFile.Options` has `Path`,
+`loader.Find(id)` and `loader.Snapshot()` work without a file. Edits may be issued from several
+threads; they are applied one at a time. Do not issue them from the load path of a plugin the
+loader manages, because the edit in progress waits for that load. `JsonConfigFile.Options` has `Path`,
 `Watch` (default on), `DebounceMs` and `Initial` (written when the file does not exist).
 
 ## Swapping implementations
@@ -479,6 +481,15 @@ Persist config in a `JsonConfigFile`, and let plugins that can adopt changes che
   `await`.
 - **Independent fibers reload concurrently.** Do not rely on the order in which sibling plugins
   load after a shared change.
+- **Take side effects inside an effect.** A plugin body can run while its fiber is being disposed
+  on another thread; its `ctx.Effect(...)` calls are then refused with `InactiveFiberException`.
+  Work done inside the effect body is skipped with it, but work done before or outside it (a
+  counter, a registration, an open file) is never undone.
+- **Callbacks that outlive a load may hit a disposed context.** A timer or socket handler holding
+  `ctx` gets `InactiveFiberException` from `ctx.Effect(...)` once the fiber is disposed. Effects it
+  creates while the fiber is merely unloaded (`Pending`) are released when the fiber is disposed.
+- **A disposed root context is inert.** After `await root.DisposeAsync()`, `root.Effect(...)`,
+  `root.Plugin(...)` and similar calls throw. Build a new `Context` instead of reusing it.
 
 ## Testing
 

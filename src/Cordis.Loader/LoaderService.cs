@@ -131,6 +131,11 @@ public sealed class LoaderService : Service
     private readonly Dictionary<(bool Private, string Label), IsolateKey> _realms = [];
     private List<EntryOptions> _current = [];
 
+    // Serialises structural edits. Each reconciliation reads the live table, awaits plugin
+    // disposal and updates in between, and writes the table back, so two of them must not
+    // interleave. Held only while reconciling, not while waiting for plugins to settle.
+    private readonly SemaphoreSlim _edits = new(1, 1);
+
     public LoaderService(Context ctx) : base(ctx, "loader")
     {
         Resolver = new TypePluginResolver();
@@ -159,8 +164,27 @@ public sealed class LoaderService : Service
         lock (_entries) return _current.Select(options => options.Clone()).ToList();
     }
 
-    /// <summary>Diff the desired tree against the live one and reconcile.</summary>
+    /// <summary>
+    /// Diff the desired tree against the live one and reconcile, then wait for the entries to
+    /// settle. Safe to call concurrently: edits are applied one at a time. Do not call it from the
+    /// load path of a plugin this loader manages; the edit in progress waits for that load.
+    /// </summary>
     public async Task ApplyAsync(IReadOnlyList<EntryOptions> desired)
+    {
+        await _edits.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            await ReconcileAsync(desired).ConfigureAwait(false);
+        }
+        finally
+        {
+            _edits.Release();
+        }
+        await WaitAllAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>Reconcile the live entries with <paramref name="desired"/>. Caller holds <see cref="_edits"/>.</summary>
+    private async Task ReconcileAsync(IReadOnlyList<EntryOptions> desired)
     {
         var flattened = new Dictionary<string, (EntryOptions Options, string? ParentId)>(StringComparer.Ordinal);
         Flatten(desired, null, flattened);
@@ -179,7 +203,6 @@ public sealed class LoaderService : Service
         }
 
         lock (_entries) _current = desired.Select(options => options.Clone()).ToList();
-        await WaitAllAsync().ConfigureAwait(false);
 
         int Depth(string? parentId)
         {
@@ -203,13 +226,28 @@ public sealed class LoaderService : Service
         }
     }
 
+    /// <summary>Enable or disable one entry. Safe to call concurrently with other edits.</summary>
     public async Task SetDisabledAsync(string id, bool disabled)
     {
-        var entry = Find(id) ?? throw new CordisException($"unknown entry \"{id}\"");
-        var options = entry.Options.Clone();
-        options.Disabled = disabled;
-        Patch(_current, id, options);
-        await ApplyAsync(_current).ConfigureAwait(false);
+        await _edits.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var entry = Find(id) ?? throw new CordisException($"unknown entry \"{id}\"");
+            var options = entry.Options.Clone();
+            options.Disabled = disabled;
+            List<EntryOptions> desired;
+            lock (_entries)
+            {
+                Patch(_current, id, options);
+                desired = _current.Select(item => item.Clone()).ToList();
+            }
+            await ReconcileAsync(desired).ConfigureAwait(false);
+        }
+        finally
+        {
+            _edits.Release();
+        }
+        await WaitAllAsync().ConfigureAwait(false);
         ConfigChanged?.Invoke();
     }
 
@@ -350,8 +388,11 @@ public sealed class LoaderService : Service
         options.Config = simplified is null
             ? null
             : JsonSerializer.SerializeToElement(simplified, simplified.GetType(), JsonOptions);
-        entry.Options = options;
-        lock (_entries) Patch(_current, entry.Id, options.Clone());
+        lock (_entries)
+        {
+            entry.Options = options;
+            Patch(_current, entry.Id, options.Clone());
+        }
         ConfigChanged?.Invoke();
     }
 

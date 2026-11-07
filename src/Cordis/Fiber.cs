@@ -39,8 +39,12 @@ public sealed class Fiber : IAsyncDisposable
     private string _epoch = InactiveEpoch;
     private int _revision;
     private Task? _inertia;
-    private Exception? _error;
-    private object? _instance;
+    private int? _uid;
+    // read without the lock by other threads (State, Error, Config, Instance); written under it
+    private volatile FiberState _state = FiberState.Pending;
+    private volatile Exception? _error;
+    private volatile object? _config;
+    private volatile object? _instance;
     private TaskCompletionSource? _releaseSignal;
 
     /// <summary>Root fiber: always active, owns nothing but the top-level effects.</summary>
@@ -110,6 +114,11 @@ public sealed class Fiber : IAsyncDisposable
                     await inertia.ConfigureAwait(false);
                 }
 
+                // Effects created after the last unload took its snapshot (a callback that outlived
+                // its load, a pending fiber) are still owned by this fiber. With Uid gone no new
+                // effect can be added, so this drain is final.
+                await DisposeEffectsAsync().ConfigureAwait(false);
+
                 // SetEpoch above is a no-op for a fiber that never loaded or that failed, so the
                 // state is re-derived here; with Uid gone it settles to Disposed.
                 lock (Gate) UpdateState(static () => null);
@@ -119,8 +128,12 @@ public sealed class Fiber : IAsyncDisposable
 
     internal object Gate { get; }
 
-    /// <summary>Incrementing identity; <c>null</c> once disposed.</summary>
-    public int? Uid { get; private set; }
+    /// <summary>Incrementing identity; <c>null</c> once disposed. Effects can be created only while it is set.</summary>
+    public int? Uid
+    {
+        get { lock (Gate) return _uid; }
+        private set { lock (Gate) _uid = value; }
+    }
 
     /// <summary>The context this fiber was created from.</summary>
     public Context Parent { get; }
@@ -136,9 +149,17 @@ public sealed class Fiber : IAsyncDisposable
     /// validated against the plugin's schema on every load, so it is never stale against a
     /// replaced schema.
     /// </summary>
-    public object? Config { get; private set; }
+    public object? Config
+    {
+        get => _config;
+        private set => _config = value;
+    }
 
-    public FiberState State { get; private set; } = FiberState.Pending;
+    public FiberState State
+    {
+        get => _state;
+        private set => _state = value;
+    }
 
     public Exception? Error => _error;
 
@@ -173,7 +194,10 @@ public sealed class Fiber : IAsyncDisposable
 
     public void AssertActive()
     {
-        if (Uid is null) throw new InactiveFiberException();
+        lock (Gate)
+        {
+            if (_uid is null) throw new InactiveFiberException();
+        }
     }
 
     /// <summary>Acquire a resource; the returned cleanup runs when the fiber unloads.</summary>
@@ -264,9 +288,15 @@ public sealed class Fiber : IAsyncDisposable
 
     private EffectHandle Run(string label, Func<EffectHandle, Task?> body)
     {
-        AssertActive();
         var handle = new EffectHandle(this, label);
-        lock (Gate) _effects.Add(handle);
+
+        // The check and the registration are one step: disposal clears Uid under the same lock
+        // before it takes its final snapshot, so an effect is either refused or seen by that drain.
+        lock (Gate)
+        {
+            if (_uid is null) throw new InactiveFiberException();
+            _effects.Add(handle);
+        }
 
         Task? task;
         try
@@ -317,8 +347,34 @@ public sealed class Fiber : IAsyncDisposable
     internal void AttachDisposer(Disposer disposer, string label)
     {
         var handle = new EffectHandle(this, label);
-        lock (Gate) _effects.Add(handle);
+        lock (Gate)
+        {
+            if (_uid is null)
+            {
+                _ = disposer();
+                return;
+            }
+            _effects.Add(handle);
+        }
         handle.Collect(disposer);
+    }
+
+    /// <summary>Take every effect the fiber holds and dispose them, newest first.</summary>
+    private async Task DisposeEffectsAsync()
+    {
+        EffectHandle[] effects;
+        lock (Gate)
+        {
+            effects = [.. _effects];
+            _effects.Clear();
+            _loadTasks.Clear();
+        }
+
+        for (var i = effects.Length - 1; i >= 0; i--)
+        {
+            try { await effects[i].DisposeAsync().ConfigureAwait(false); }
+            catch (Exception error) { Ctx.Logger.Error(error); }
+        }
     }
 
     // ------------------------------------------------------- dependency graph
@@ -390,7 +446,7 @@ public sealed class Fiber : IAsyncDisposable
     {
         lock (Gate)
         {
-            if (Uid is null) return;
+            if (_uid is null) return;
             var builder = new StringBuilder().Append(_revision);
             foreach (var name in _inject.Keys)
             {
@@ -432,7 +488,7 @@ public sealed class Fiber : IAsyncDisposable
 
     private FiberState ComputeState()
     {
-        if (Uid is null) return FiberState.Disposed;
+        if (_uid is null) return FiberState.Disposed;
         if (_error is not null) return FiberState.Failed;
         return _epoch != InactiveEpoch ? FiberState.Active : FiberState.Pending;
     }
@@ -454,8 +510,10 @@ public sealed class Fiber : IAsyncDisposable
 
     private async Task ReloadAsync()
     {
-        await Task.Yield(); // mirror cordis: the plugin body never runs inside ctx.Plugin()
-
+        // This prefix runs synchronously inside the lock of the caller that scheduled the load, so
+        // the target and the committed bindings are the ones the load was started for. Read after
+        // the yield, a change in between could turn the target into "inactive"; the load would then
+        // run the plugin against nothing and settle without ever unloading it.
         string epoch;
         lock (Gate)
         {
@@ -466,6 +524,8 @@ public sealed class Fiber : IAsyncDisposable
             }
             epoch = _epoch;
         }
+
+        await Task.Yield(); // mirror cordis: the plugin body never runs inside ctx.Plugin()
 
         try
         {
@@ -525,19 +585,7 @@ public sealed class Fiber : IAsyncDisposable
             await wait.ConfigureAwait(false);
         }
 
-        EffectHandle[] effects;
-        lock (Gate)
-        {
-            effects = [.. _effects];
-            _effects.Clear();
-            _loadTasks.Clear();
-        }
-
-        for (var i = effects.Length - 1; i >= 0; i--)
-        {
-            try { await effects[i].DisposeAsync().ConfigureAwait(false); }
-            catch (Exception error) { Ctx.Logger.Error(error); }
-        }
+        await DisposeEffectsAsync().ConfigureAwait(false);
 
         lock (Gate)
         {
@@ -624,7 +672,7 @@ public sealed class Fiber : IAsyncDisposable
     {
         lock (Gate)
         {
-            if (Uid is null) return;
+            if (_uid is null) return;
             if (!ReferenceEquals(runtime, Runtime))
             {
                 Runtime!.Detach(this);
@@ -730,18 +778,10 @@ public sealed class Fiber : IAsyncDisposable
             return;
         }
 
-        // root fiber: tear the whole tree down
-        EffectHandle[] effects;
-        lock (Gate)
-        {
-            effects = [.. _effects];
-            _effects.Clear();
-        }
-        for (var i = effects.Length - 1; i >= 0; i--)
-        {
-            try { await effects[i].DisposeAsync().ConfigureAwait(false); }
-            catch (Exception error) { Ctx.Logger.Error(error); }
-        }
+        // Root fiber: refuse new effects first (they could otherwise land after the snapshot and
+        // never be released), then tear the whole tree down. A disposed root context is inert.
+        lock (Gate) _uid = null;
+        await DisposeEffectsAsync().ConfigureAwait(false);
     }
 
     private sealed class UpdateHook(ConfigUpdateHandler handler)

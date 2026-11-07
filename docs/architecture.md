@@ -87,7 +87,7 @@ sequenceDiagram
         F->>F: stays Pending
     end
     Ctx-->>Caller: Fiber (awaitable)
-    Note over F: ReloadAsync (after Task.Yield):<br/>commit bindings, validate config,<br/>run body, IAsyncInit, drain async effects -> Active
+    Note over F: ReloadAsync: commit bindings and capture the target (under the lock),<br/>Task.Yield, then validate config,<br/>run body, IAsyncInit, drain async effects -> Active
 ```
 
 ## Flow: a provider appears or disappears
@@ -167,9 +167,16 @@ applied as an update, anything else recreates the entry.
 
 - **One lock per tree.** Every context in a tree shares one `SyncRoot`. All state transitions,
   store mutations, registry changes and listener registrations take it.
-- **No await under the lock.** Transitions are started inside the lock but begin with
-  `await Task.Yield()`, so their synchronous prefix ends there and plugin code never runs while
-  the lock is held.
+- **No await under the lock.** Transitions are started inside the lock and yield
+  (`await Task.Yield()`) before any plugin code, so plugin code never runs while the lock is held.
+  What the transition must agree with its caller on (the target epoch, the committed bindings) is
+  read before the yield, still inside the caller's lock.
+- **Disposal closes the door first.** Disposing a fiber, or the root, clears its uid under the
+  lock before taking the final snapshot of its effects. An effect requested from another thread is
+  either refused (`InactiveFiberException`) or included in that snapshot; it can never be added
+  after it and leak.
+- **Loader edits are serialised.** `ApplyAsync` and `SetDisabledAsync` hold an async mutex while
+  they reconcile, so concurrent edits apply one after another.
 - **Independent fibers run concurrently.** Two fibers that react to the same change reload on the
   thread pool independently; only one fiber's own transitions are serialised.
 - **Notifications are synchronous.** Checking dependents and deciding to load or unload happens
